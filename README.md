@@ -1,4 +1,5 @@
 # V3D_SPHERE
+[![Preview del video](./Ensamblado_2026-Feb-27_07-56-40PM-000_CustomizedView25278896554.png)](./Ensamblado_2026-Feb-27_07-57-41PM-000_CustomizedView25917584431_mp4.mp4)
 <img width="261" height="326" alt="image" src="https://github.com/user-attachments/assets/0aaaaee6-5bc7-4fba-b97f-1dde35b30e54" />
 <img width="261" height="326" alt="image" src="https://github.com/user-attachments/assets/ab72632e-d174-454f-9fa9-7db2d2f161be" />
 <img width="261" height="326" alt="image" src="https://github.com/user-attachments/assets/053b8ab3-2938-43a3-a5b1-c1047fea413d" />
