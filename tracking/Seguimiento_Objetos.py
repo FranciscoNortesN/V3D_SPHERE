@@ -1,6 +1,33 @@
 import cv2
+import numpy as np
 import random
 import time
+import json
+
+QR_SIDE_MM = 50.0        # Physical side length of the reference QR code (mm)
+OUTPUT_FILE = 'positions.json'  # File where XYZ positions are written each frame
+
+# QR depth
+qr_detector = cv2.QRCodeDetector()
+
+def detect_qr(frame):
+    ok, points = qr_detector.detect(frame)
+    if ok and points is not None:
+        pts = points[0]  # shape (4, 2)
+        return pts
+    return None
+
+def qr_side_pixels(pts):
+    sides = [np.linalg.norm(pts[(i + 1) % 4] - pts[i]) for i in range(4)]
+    return float(np.mean(sides))
+
+def estimate_focal_length(frame_width, hfov_deg=60.0):
+    return frame_width / (2.0 * np.tan(np.radians(hfov_deg / 2.0)))
+
+def compute_xyz(pixel_x, pixel_y, depth_z, focal_px, cx, cy):
+    x = (pixel_x - cx) * depth_z / focal_px
+    y = (pixel_y - cy) * depth_z / focal_px
+    return round(x, 1), round(y, 1), round(depth_z, 1)
 
 clicked_points = []
 
@@ -128,67 +155,28 @@ except Exception:
             multi = FallbackMultiTracker()
 
 # Añadir tracker a cada ROI y asignarle un color
+def _create_tracker():
+    creators = [
+        lambda: cv2.legacy.TrackerCSRT_create(),
+        lambda: cv2.TrackerCSRT_create(),
+        lambda: cv2.TrackerCSRT.create(),
+    ]
+
+    for create in creators:
+        try:
+            tracker = create()
+            print(f"Tracker created: {type(tracker).__name__}")
+            return tracker
+        except AttributeError:
+            continue
+
+
 colors = []
 for r in rois:
-    tr = None
-    # Try several common Tracker CSRT constructors
-    constructors = []
-    try:
-        constructors.append(lambda: cv2.legacy.TrackerCSRT_create())
-    except Exception:
-        pass
-    try:
-        constructors.append(lambda: cv2.TrackerCSRT_create())
-    except Exception:
-        pass
-    try:
-        constructors.append(lambda: cv2.TrackerCSRT.create())
-    except Exception:
-        pass
-    try:
-        constructors.append(lambda: cv2.Tracker_create('CSRT'))
-    except Exception:
-        pass
-    for ctor in constructors:
-        try:
-            tr = ctor()
-            break
-        except Exception:
-            tr = None
+    tr = _create_tracker()
     if tr is None:
-        # Fallback to another tracker type if CSRT not available
-        tracker_types = []
-        try:
-            tracker_types.append(lambda: cv2.TrackerKCF_create())
-        except Exception:
-            pass
-        try:
-            tracker_types.append(lambda: cv2.legacy.TrackerKCF_create())
-        except Exception:
-            pass
-        try:
-            tracker_types.append(lambda: cv2.TrackerMOSSE_create())
-        except Exception:
-            pass
-        try:
-            tracker_types.append(lambda: cv2.legacy.TrackerMOSSE_create())
-        except Exception:
-            pass
-        try:
-            tracker_types.append(lambda: cv2.TrackerMedianFlow_create())
-        except Exception:
-            pass
-        
-        for ctor in tracker_types:
-            try:
-                tr = ctor()
-                break
-            except Exception:
-                tr = None
-        
-        if tr is None:
-            print('Failed to create a tracker for ROI, skipping this object.')
-            continue
+        print('Failed to create a tracker for ROI, skipping this object.')
+        continue
     # Try common add/init signatures
     try:
         multi.add(tr, first, r)
@@ -204,19 +192,82 @@ for r in rois:
 
 cv2.destroyWindow('Selecciona objetos')
 
-# Mostrar frame por frame el seguimiento
+# ─── Prepare depth-mapping state ─────────────────────────────────────────────
+frame_h, frame_w = first.shape[:2]
+focal_px = estimate_focal_length(frame_w)  # estimated from ~60° HFOV
+cx, cy = frame_w / 2.0, frame_h / 2.0      # principal point (image centre)
+last_depth_z = None  # most recent depth estimate from QR (mm)
+
+print(f'Focal length estimate: {focal_px:.1f} px  |  Frame: {frame_w}x{frame_h}')
+print(f'QR reference size: {QR_SIDE_MM} mm  |  Output → {OUTPUT_FILE}')
+print('Tracking started. Press Esc to stop.\n')
+
+# ─── Tracking + XYZ estimation loop ──────────────────────────────────────────
 while True:
     ret, frame = cap.read()
     if not ret:
         print('Frame read failed, stopping.')
         break
 
+    # --- QR code depth update --------------------------------------------------
+    qr_pts = detect_qr(frame)
+    if qr_pts is not None:
+        side_px = qr_side_pixels(qr_pts)
+        if side_px > 0:
+            # Z = (known_size_mm * focal_px) / apparent_size_px
+            last_depth_z = (QR_SIDE_MM * focal_px) / side_px
+        # Draw QR outline
+        for j in range(4):
+            p1 = tuple(qr_pts[j].astype(int))
+            p2 = tuple(qr_pts[(j + 1) % 4].astype(int))
+            cv2.line(frame, p1, p2, (255, 0, 255), 2)
+        if last_depth_z is not None:
+            qr_cx, qr_cy = np.mean(qr_pts, axis=0).astype(int)
+            cv2.putText(frame, f'Z:{last_depth_z:.0f}mm', (qr_cx, qr_cy - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
+    # --- Update trackers -------------------------------------------------------
     ok, boxes = multi.update(frame)
 
+    frame_positions = []  # collect XYZ for all objects this frame
+
     for i, b in enumerate(boxes):
-        x, y, w, h = [int(v) for v in b]
-        cv2.rectangle(frame, (x, y), (x+w, y+h), colors[i], 2)
-        cv2.putText(frame, f'ID:{i+1}', (x, y-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colors[i], 2)
+        bx, by, bw, bh = [int(v) for v in b]
+        # Bounding-box centre in pixels
+        obj_cx = bx + bw // 2
+        obj_cy = by + bh // 2
+
+        cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), colors[i], 2)
+
+        if last_depth_z is not None:
+            x_mm, y_mm, z_mm = compute_xyz(obj_cx, obj_cy, last_depth_z,
+                                           focal_px, cx, cy)
+            label = f'ID:{i+1} X:{x_mm} Y:{y_mm} Z:{z_mm}'
+            frame_positions.append({
+                'id': i + 1,
+                'pixel': [obj_cx, obj_cy],
+                'xyz_mm': [x_mm, y_mm, z_mm]
+            })
+        else:
+            label = f'ID:{i+1} (no QR → no depth)'
+            frame_positions.append({
+                'id': i + 1,
+                'pixel': [obj_cx, obj_cy],
+                'xyz_mm': None
+            })
+
+        cv2.putText(frame, label, (bx, by - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[i], 2)
+
+    # --- Output positions (console + file) ------------------------------------
+    if frame_positions:
+        payload = json.dumps(frame_positions)
+        print(payload)
+        try:
+            with open(OUTPUT_FILE, 'w') as f:
+                json.dump(frame_positions, f)
+        except OSError:
+            pass
 
     cv2.imshow('Tracking', frame)
     k = cv2.waitKey(30) & 0xFF
